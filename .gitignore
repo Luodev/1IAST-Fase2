@@ -1,0 +1,20 @@
+# credenciais - NUNCA commitar
+rodar_aws.ps1
+
+# dados gerados pelo pipeline (recriados a cada execucao)
+datalake/
+
+# dados brutos baixados automaticamente pelo pipeline
+dados_fonte/
+
+# editor
+.vscode/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# spark
+spark-warehouse/
+*.log
