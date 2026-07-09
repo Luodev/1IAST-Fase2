@@ -8,11 +8,14 @@
 #   SILVER -> dados limpos, padronizados e integrados
 #   GOLD   -> tabelas analíticas (indicador x metas, evolução, agregados)
 #
+# Também tem a parte de streaming: um simulador gera eventos de novas medições
+# de proficiência de alunos e o Structured Streaming consome em micro-lotes.
+#
 # Para rodar local:   python pipeline_medalhao.py batch
 # Para rodar na AWS:  definir LAKE_URI=s3a://meu-bucket/datalake + credenciais
 #                     (ver rodar_aws.example.ps1)
 #
-# Comandos: batch
+# Comandos: batch | produzir | stream | demo
 # =============================================================================
 
 import argparse
@@ -21,6 +24,7 @@ import logging
 import os
 import random
 import sys
+import threading
 import time
 import urllib.request
 import uuid
@@ -80,6 +84,8 @@ UFS_VALIDAS = {"AC", "AL", "AM", "AP", "BA", "CE", "DF", "ES", "GO", "MA", "MG",
 # ponto de corte da escala Saeb definido pela pesquisa Alfabetiza Brasil:
 # aluno com proficiência >= 743 é considerado alfabetizado
 PONTO_CORTE_SAEB = 743.0
+
+PASTA_LANDING = "landing/eventos_alunos"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s",
                     datefmt="%H:%M:%S")
@@ -460,6 +466,143 @@ def executar_gold(spark):
 
 
 # -----------------------------------------------------------------------------
+# STREAMING - simulador de eventos + structured streaming
+# -----------------------------------------------------------------------------
+# na AWS de verdade os eventos chegariam via Kinesis Firehose e cairiam no
+# s3://bucket/landing/. aqui o simulador grava os JSON direto na landing e o
+# structured streaming fica monitorando a pasta - o código é o mesmo nos dois.
+
+def produzir_eventos(qtd_lotes=10, eventos_por_lote=50, intervalo=2.0):
+    """Simula eventos de novas medições de proficiência (usa municípios reais)."""
+    import pandas as pd
+
+    arquivos = baixar_fontes_inep()
+    mun = pd.read_excel(arquivos["inep_resultados_metas_municipio"],
+                        sheet_name=ABAS_INEP["inep_resultados_metas_municipio"],
+                        header=None, skiprows=2, dtype=str)
+    municipios = mun[[3, 2]].dropna().values.tolist()  # [codigo_municipio, sigla_uf]
+
+    if USA_S3:
+        import boto3
+        s3 = boto3.client("s3")
+        sem_prefixo = LAKE_URI[len("s3a://"):]
+        bucket, _, prefixo = sem_prefixo.partition("/")
+    else:
+        pasta = os.path.join(LAKE_URI, PASTA_LANDING)
+        os.makedirs(pasta, exist_ok=True)
+
+    log.info("[produtor] %d lotes de %d eventos a cada %.0fs", qtd_lotes, eventos_por_lote, intervalo)
+
+    for lote in range(qtd_lotes):
+        eventos = []
+        for _ in range(eventos_por_lote):
+            id_mun, sigla = random.choice(municipios)
+            eventos.append({
+                "id_evento": str(uuid.uuid4()),
+                "tipo_evento": "nova_medicao_proficiencia",
+                "id_aluno": str(uuid.uuid4())[:8],
+                "id_municipio": id_mun,
+                "sigla_uf": sigla,
+                "serie": "2º ano EF",
+                "rede": random.choice(["MUNICIPAL", "ESTADUAL"]),
+                "proficiencia": round(random.gauss(750, 60), 2),
+                "presenca": "P",
+                "ts_evento": datetime.now(timezone.utc).isoformat(),
+            })
+        conteudo = "\n".join(json.dumps(e, ensure_ascii=False) for e in eventos)
+        nome_arq = f"eventos_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{lote:03d}.json"
+
+        if USA_S3:
+            chave = "/".join(p for p in [prefixo, PASTA_LANDING, nome_arq] if p)
+            s3.put_object(Bucket=bucket, Key=chave, Body=conteudo.encode("utf-8"))
+        else:
+            with open(os.path.join(pasta, nome_arq), "w", encoding="utf-8") as f:
+                f.write(conteudo)
+
+        log.info("[produtor] lote %d/%d publicado", lote + 1, qtd_lotes)
+        time.sleep(intervalo)
+
+    log.info("[produtor] fim: %d eventos publicados", qtd_lotes * eventos_por_lote)
+
+
+def executar_streaming(spark, duracao=60):
+    """Consome os eventos da landing com Structured Streaming:
+    landing (json) -> bronze_stream (parquet) -> gold_stream (taxa por UF)."""
+    from pyspark.sql import functions as F
+    from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+
+    schema = StructType([
+        StructField("id_evento", StringType()),
+        StructField("tipo_evento", StringType()),
+        StructField("id_aluno", StringType()),
+        StructField("id_municipio", StringType()),
+        StructField("sigla_uf", StringType()),
+        StructField("serie", StringType()),
+        StructField("rede", StringType()),
+        StructField("proficiencia", DoubleType()),
+        StructField("presenca", StringType()),
+        StructField("ts_evento", StringType()),
+    ])
+
+    origem = caminho(PASTA_LANDING)
+    if not USA_S3:
+        os.makedirs(origem, exist_ok=True)
+
+    log.info("========== STREAMING (%ds) ==========", duracao)
+    log.info("monitorando %s", origem)
+
+    stream = (
+        spark.readStream.schema(schema)
+        .option("maxFilesPerTrigger", 5)
+        .json(origem)
+        .withColumn("ts_evento", F.to_timestamp("ts_evento"))
+        .withColumn("_ingestao_ts", F.current_timestamp())
+        # regra de negócio: proficiência >= 743 na escala Saeb = alfabetizado
+        .withColumn("alfabetizado", F.col("proficiencia") >= F.lit(PONTO_CORTE_SAEB))
+    )
+
+    def processa_lote(df_lote, id_lote):
+        if df_lote.isEmpty():
+            return
+        # qualidade no streaming: tira evento sem chave, proficiência absurda e duplicado
+        validos = df_lote.filter(
+            F.col("id_evento").isNotNull()
+            & F.col("id_municipio").isNotNull()
+            & F.col("proficiencia").between(0, 1500)
+        ).dropDuplicates(["id_evento"])
+
+        validos.write.mode("append").parquet(caminho("bronze_stream", "eventos_alunos"))
+
+        # recalcula o agregado com tudo que já chegou até agora
+        acumulado = df_lote.sparkSession.read.parquet(caminho("bronze_stream", "eventos_alunos"))
+        agregado = (acumulado.groupBy("sigla_uf")
+                    .agg(F.count("*").alias("medicoes"),
+                         F.round(F.avg("proficiencia"), 2).alias("proficiencia_media"),
+                         F.round(100 * F.avg(F.col("alfabetizado").cast("double")), 2)
+                          .alias("taxa_alfabetizacao_tempo_real"),
+                         F.max("ts_evento").alias("ultima_medicao")))
+        agregado.write.mode("overwrite").parquet(caminho("gold_stream", "taxa_alfabetizacao_uf_tempo_real"))
+        log.info("[streaming] micro-lote %d: %d eventos validos", id_lote, validos.count())
+
+    consulta = (stream.writeStream
+                .foreachBatch(processa_lote)
+                .option("checkpointLocation", caminho("_checkpoints", "eventos_alunos"))
+                .trigger(processingTime="5 seconds")
+                .start())
+
+    consulta.awaitTermination(duracao)
+    consulta.stop()
+    log.info("[streaming] encerrado")
+
+    try:
+        resultado = spark.read.parquet(caminho("gold_stream", "taxa_alfabetizacao_uf_tempo_real"))
+        log.info("[streaming] taxa de alfabetizacao em tempo quase real por UF:")
+        resultado.orderBy("sigla_uf").show(30, truncate=False)
+    except Exception:
+        log.warning("nenhum evento processado ainda - rode o comando 'produzir' antes/junto")
+
+
+# -----------------------------------------------------------------------------
 # MAIN
 # -----------------------------------------------------------------------------
 
@@ -480,13 +623,37 @@ def main():
 
     sub.add_parser("batch", help="roda o pipeline batch (bronze -> silver -> gold)")
 
+    p = sub.add_parser("produzir", help="simula eventos de medicao (streaming)")
+    p.add_argument("--lotes", type=int, default=10)
+    p.add_argument("--eventos", type=int, default=50)
+    p.add_argument("--intervalo", type=float, default=2.0)
+
+    p = sub.add_parser("stream", help="consome os eventos com structured streaming")
+    p.add_argument("--duracao", type=int, default=60)
+
+    p = sub.add_parser("demo", help="batch + streaming de uma vez")
+    p.add_argument("--duracao", type=int, default=45)
+
     args = parser.parse_args()
     log.info("data lake: %s (%s)", LAKE_URI, "AWS S3" if USA_S3 else "local")
+
+    if args.comando == "produzir":
+        produzir_eventos(args.lotes, args.eventos, args.intervalo)
+        return
 
     spark = criar_spark()
     try:
         if args.comando == "batch":
             rodar_batch(spark)
+        elif args.comando == "stream":
+            executar_streaming(spark, args.duracao)
+        elif args.comando == "demo":
+            rodar_batch(spark)
+            produtor = threading.Thread(target=produzir_eventos,
+                                        kwargs={"qtd_lotes": 8, "eventos_por_lote": 60, "intervalo": 3.0},
+                                        daemon=True)
+            produtor.start()
+            executar_streaming(spark, args.duracao)
     finally:
         spark.stop()
 
