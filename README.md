@@ -1,134 +1,186 @@
-# Tech Challenge – Fase 2 | Pipeline Híbrido para Análise da Alfabetização no Brasil
+# Tech Challenge — Fase 2 | Pipeline Híbrido para Análise da Alfabetização no Brasil
 
-Pipeline de dados híbrido (batch + streaming) com arquitetura medalhão (Bronze → Silver → Gold), feito em PySpark e integrado à AWS (S3), para analisar o **Indicador Criança Alfabetizada** do INEP.
+Pipeline híbrida de dados (**Batch + Streaming**) na AWS, com **Arquitetura Medalhão** (Bronze → Silver → Gold), para analisar o **Indicador Criança Alfabetizada** (INEP/Saeb) e compará-lo com as metas nacionais, estaduais e municipais do Compromisso Nacional Criança Alfabetizada.
+
+> **POSTECH AI Scientist — Tech Challenge Fase 2**
+
+---
 
 ## 1. Contexto do problema
 
-O Compromisso Nacional Criança Alfabetizada é a política pública que busca garantir que toda criança brasileira esteja alfabetizada até o final do 2º ano do ensino fundamental. Para medir isso, o INEP realizou em 2023 a pesquisa Alfabetiza Brasil, que definiu o ponto de corte de **743 pontos na escala Saeb**: a criança que atinge essa proficiência é considerada alfabetizada.
+A alfabetização na infância é um dos pilares do desenvolvimento educacional, social e econômico do país. O **Compromisso Nacional Criança Alfabetizada** mobiliza União, estados, DF e municípios para garantir que toda criança brasileira esteja alfabetizada até o final do **2º ano do ensino fundamental**.
 
-A partir desse corte foi criado o **Indicador Criança Alfabetizada (ICA)**, que é o percentual de alunos que atingem esse nível. A meta nacional é chegar a 100% até 2030, com metas intermediárias pactuadas por estado e por município.
+Para dar régua a essa política, o INEP realizou em 2023 a pesquisa **Alfabetiza Brasil**, que definiu o ponto de corte de **743 pontos na escala de proficiência do Saeb**: a criança que atinge esse patamar é considerada alfabetizada. Nasceu daí o **Indicador Criança Alfabetizada (ICA)** — o percentual de estudantes que atingem essa proficiência — com meta nacional de 100% até **2030** e metas intermediárias pactuadas por UF e por município.
 
-O desafio de dados é que essas informações vêm de fontes diferentes (resultados por UF, resultados por município, metas anuais, microdados de alunos) e precisam ser integradas com qualidade para permitir análises de desigualdade educacional e apoiar políticas públicas.
+O desafio de engenharia é que resultados e metas vêm de **fontes heterogêneas** (indicador por município, indicador por UF, metas Brasil/UF/município), em granularidades e formatos diferentes, e ainda chegam **atualizações contínuas de medições** ao longo do tempo. Integrar tudo com qualidade é o que permite análises de desigualdade educacional e **políticas públicas baseadas em evidências**.
 
 ## 2. Fontes de dados
 
-| Entidade | Fonte | Modo |
-|---|---|---|
-| UF (resultados Saeb 2019/2021/2023 + metas 2024–2030, inclui Brasil) | INEP – [resultados_e_metas_ufs.xlsx](https://download.inep.gov.br/avaliacao_da_alfabetizacao/resultados_e_metas_ufs.xlsx) | Batch |
-| Município (resultados + metas + nível de alfabetização) | INEP – [resultados_e_metas_municipios.xlsx](https://download.inep.gov.br/avaliacao_da_alfabetizacao/resultados_e_metas_municipios.xlsx) | Batch |
-| Tabelas uf, municipio, metas e alunos | [Base dos Dados](https://basedosdados.org/dataset/073a39d4-89cf-4068-b1e8-34ed0d9c0b72) (BigQuery) | Batch (opcional, precisa de projeto GCP) |
-| Novas medições de proficiência de alunos | Simulador de eventos (formato da tabela `alunos`) | Streaming |
+Dados reais da plataforma [Base dos Dados — Indicador Criança Alfabetizada](https://basedosdados.org/dataset/073a39d4-89cf-4068-b1e8-34ed0d9c0b72) (origem INEP), versionados em [`dados/`](dados/):
 
-Obs.: os arquivos do INEP são a fonte original dos dados que a Base dos Dados disponibiliza no BigQuery. O pipeline suporta as duas vias — a do BigQuery é ativada definindo a variável `GCP_BILLING_PROJECT` (é a única forma de obter os microdados de alunos, que não têm download público).
+| Entidade | Arquivo | Linhas | Modo |
+|---|---|---:|---|
+| Indicador por município | `br_inep_avaliacao_alfabetizacao_municipio.csv` | 23.995 | Batch |
+| Indicador por UF | `br_inep_avaliacao_alfabetizacao_uf.csv` | 145 | Batch |
+| Meta Brasil | `..._meta_alfabetizacao_brasil.csv` | 3 | Batch |
+| Meta por UF | `..._meta_alfabetizacao_uf.csv` | 54 | Batch |
+| Meta por município | `..._meta_alfabetizacao_municipio.csv` | 10.704 | Batch |
+| Novas medições do indicador | Eventos sintéticos (Lambda Producer → Kafka/MSK) | contínuo | Streaming |
 
-## 3. Arquitetura
+O streaming simula a chegada de **atualizações de indicadores em tempo quase real** (novas medições por município, com o mesmo schema INEP), publicadas num tópico Kafka e consumidas por Spark Structured Streaming.
+
+## 3. Arquitetura proposta
+
+```mermaid
+flowchart LR
+    subgraph BATCH
+        CSV[CSVs INEP<br/>dados/] -->|setup.sh seção 10| RAW[(S3 Bronze<br/>/raw)]
+        RAW -->|Glue: etl_bronze.py| BR[(S3 Bronze<br/>/bronze — Parquet)]
+        BR -->|Glue: etl_silver.py<br/>DQ pass/quarentena| SV[(S3 Silver<br/>/sot)]
+        SV -->|Glue: etl_gold.py<br/>4 visões analíticas| GD[(S3 Gold<br/>/gold)]
+    end
+
+    subgraph STREAMING
+        EB[EventBridge<br/>rate 5 min] --> LP[Lambda Producer<br/>confluent-kafka]
+        LP -->|PLAINTEXT :9092| MSK[MSK<br/>alfabetizacao-br-streaming]
+        MSK -->|Spark Structured<br/>Streaming Glue| ST[(S3 Bronze<br/>/streaming — Parquet<br/>part. year/month/day/hour)]
+        SFN[Step Functions<br/>start → wait 5min → stop → crawler] -.orquestra.-> MSK
+    end
+
+    GD --> CR1[Glue Crawler Gold]
+    ST --> CR2[Glue Crawler Streaming]
+    CR1 --> CAT[Glue Data Catalog<br/>alfabetizacao_br_db]
+    CR2 --> CAT
+    CAT --> ATH[Athena<br/>workgroup cutoff 1GB]
+    ATH --> BI[Dashboards / Estatística / ML]
+```
+
+### Fluxo de dados (Arquitetura Medalhão)
+
+1. **RAW** — os 5 CSVs do INEP são enviados a `s3://alfabetizacao-br-dev-bronze/raw/` (seção 10 do `setup.sh`).
+2. **Bronze (SOR)** — `etl_bronze.py` lê os CSVs com **schemas explícitos**, adiciona colunas de controle (hash MD5 para deduplicação, timestamp de ingestão) e grava **Parquet** particionado por `anomesdia`, preservando o histórico completo.
+3. **Silver (SOT)** — `etl_silver.py` aplica limpeza, padronização de tipos, normalização de chaves (`id_municipio` com 7 dígitos, mapa de redes 0/2/3/5 → total/estadual/municipal/privada) e as **regras de qualidade** (colunas booleanas `_dq_*` consolidadas em `_dq_passou`). Registros aprovados vão para `sot/pass/`; reprovados vão para `sot/quarentena/` com `_quarentena_motivo`. É aqui que as bases são integradas.
+4. **Gold (SPEC)** — `etl_gold.py` produz 4 visões analíticas prontas para consumo:
+
+| Visão | Descrição |
+|---|---|
+| `alfabetizacao_por_municipio` | Rede municipal + meta por município: gap e status da meta 2025 |
+| `evolucao_temporal` | Agregações por UF/ano/série (média, mín, máx, desvio) |
+| `ranking_municipios` | `rank()` por janela UF/ano (Window Function) |
+| `comparacao_metas_nacionais` | Taxa por UF × meta nacional × meta estadual |
+
+5. **Streaming** — EventBridge dispara a **Lambda Producer** a cada 5 min, que publica eventos JSON (schema INEP) no tópico MSK `alfabetizacao-br-streaming`. O job **Glue Structured Streaming** (`streaming_glue.py`) consome o tópico, valida com `StructType` explícito, enriquece com a flag `risco_alfabetizacao` (CRITICO < 60% ≤ ATENCAO < 75% ≤ NORMAL) e grava Parquet particionado por `year/month/day/hour` com `checkpointLocation` (semântica *exactly-once*). A **Step Functions** orquestra: inicia o job → aguarda 5 min → para o job → dispara o crawler.
+6. **Consumo** — os crawlers catalogam Gold e Streaming no **Glue Data Catalog** e o **Athena** consulta tudo via SQL serverless ([`athena_queries/validacao_gold.sql`](athena_queries/validacao_gold.sql)).
+
+## 4. Estrutura do repositório
 
 ```
-                         DATA LAKE (S3 ou pasta local)
- BATCH
- ┌──────────────┐     ┌─────────┐     ┌─────────┐     ┌──────────────────────┐
- │ INEP (xlsx)  ├──┐  │ BRONZE  │     │ SILVER  │     │        GOLD          │
- └──────────────┘  ├─►│ bruto,  ├────►│ limpo,  ├────►│ indicador_municipio  │
- ┌──────────────┐  │  │ append  │     │integrado│     │ evolucao_uf          │
- │ Base dosDados├──┘  └─────────┘     └────┬────┘     │ metas_x_resultados   │
- │  (BigQuery)  │                          │          └──────────────────────┘
- └──────────────┘                     validações de
-                                       qualidade
- STREAMING
- ┌──────────────┐     ┌─────────┐                     ┌──────────────────────┐
- │ simulador de │     │ landing │   Structured        │     GOLD STREAM      │
- │ eventos      ├────►│ (JSON)  ├── Streaming ───────►│ taxa_uf_tempo_real   │
- │(Kinesis/Fire-│     └─────────┘   (micro-lotes 5s)  └──────────────────────┘
- │ hose na AWS) │
- └──────────────┘      + monitoramento/ (métricas)  + qualidade/ (relatórios)
+├── setup.sh                     # Provisiona toda a infra via AWS CLI (10 seções)
+├── cleanup.sh                   # Remove todos os recursos (FinOps!)
+├── dados/                       # 5 CSVs reais do INEP (Base dos Dados)
+├── glue_jobs/
+│   ├── etl_bronze.py            # RAW (CSV) → Bronze (Parquet + hash de deduplicação)
+│   ├── etl_silver.py            # Bronze → Silver (DQ, pass/quarentena, integração)
+│   ├── etl_gold.py              # Silver → Gold (4 visões analíticas)
+│   └── streaming_glue.py        # MSK → S3 via Spark Structured Streaming
+├── lambda_functions/
+│   └── streaming_producer.py    # Publica eventos sintéticos no MSK (confluent-kafka)
+└── athena_queries/
+    └── validacao_gold.sql       # Validações de qualidade + queries analíticas
 ```
 
-### Fluxo de dados
+## 5. Como executar
 
-1. **Bronze**: os arquivos do INEP são baixados e gravados brutos em Parquet, com colunas de controle (`_fonte`, `_ingestao_ts`) e particionados pela data de ingestão em modo append — o histórico fica todo preservado.
-2. **Silver**: limpeza (valores `-`, `**`, `> 80` e rodapés de observação da planilha), padronização de nomes e tipos, normalização de chaves (`id_municipio` com 7 dígitos), deduplicação e integração (município recebe o contexto da sua UF).
-3. **Qualidade**: 9 validações entre a Silver e a Gold — duplicidade, valores ausentes, chaves válidas, integridade referencial município↔UF e faixa 0–100. O relatório fica salvo em `qualidade/relatorios/` e dá pra fazer o pipeline parar se algo reprovar (`FALHAR_EM_QUALIDADE=1`).
-4. **Gold**: três tabelas analíticas — indicador por município comparado com as metas (gaps, atingiu ou não), evolução temporal por UF (2019 → 2021 → 2023) e resumo metas × resultados por UF.
-5. **Streaming**: o simulador publica eventos JSON de novas medições na pasta de landing (na AWS seria o Kinesis Firehose entregando no S3). O Structured Streaming consome em micro-lotes de 5 segundos, valida e deduplica os eventos, grava a bronze_stream e atualiza a gold_stream com a taxa de alfabetização em tempo quase real por UF (proficiência ≥ 743 = alfabetizado).
-
-## 4. Como executar
-
-Requisitos: Java 17+ e Python 3.10 a 3.13 (o PySpark ainda não roda no 3.14). No Windows também precisa do `winutils.exe` e `hadoop.dll` (repositório [cdarlint/winutils](https://github.com/cdarlint/winutils), pasta hadoop-3.3.6/bin) em `C:\Users\<usuario>\hadoop\bin` — o script detecta sozinho.
+Pré-requisitos: AWS CLI configurada (`aws configure`) com permissão de administrador, `python3` e `pip`.
 
 ```bash
-pip install pyspark pandas openpyxl basedosdados boto3
+# 1. Provisionar a infraestrutura (~25 min; MSK leva ~15 min para ficar ACTIVE)
+bash setup.sh
 
-# pipeline batch completo (bronze -> silver -> qualidade -> gold)
-python pipeline_medalhao.py batch
+# 2. Criar o Lambda Layer confluent-kafka e a Lambda Producer
+#    (comandos impressos pela seção 7 do setup.sh — descomente o bloco após criar o Layer)
 
-# demo completa (batch + produtor de eventos + streaming)
-python pipeline_medalhao.py demo
+# 3. Pipeline BATCH (aguarde cada job concluir antes do próximo)
+aws glue start-job-run --job-name alfabetizacao-br-raw-to-bronze
+aws glue start-job-run --job-name alfabetizacao-br-bronze-to-silver
+aws glue start-job-run --job-name alfabetizacao-br-silver-to-gold
+aws glue start-crawler --name alfabetizacao-br-gold-crawler
 
-# ou o streaming em dois terminais separados:
-python pipeline_medalhao.py produzir --lotes 10 --eventos 50 --intervalo 2
-python pipeline_medalhao.py stream --duracao 60
+# 4. Pipeline STREAMING (orquestrado pela Step Functions;
+#    o ARN e o input exato são impressos ao fim do setup.sh)
+aws stepfunctions start-execution --state-machine-arn <ARN> --input '{...}'
+
+# 5. Consultar no Athena (workgroup alfabetizacao-br-workgroup)
+#    usando athena_queries/validacao_gold.sql
+
+# 6. AO TERMINAR — remover tudo para não gerar custo
+bash cleanup.sh
 ```
 
-### Executando na AWS
+## 6. Tecnologias utilizadas e justificativas
 
-O mesmo código roda na nuvem, só mudando variáveis de ambiente (não muda nada no .py):
+| Tecnologia                            | Papel                                         | Por quê                                                                                             |
+| ------------------------------------- | --------------------------------------------- | --------------------------------------------------------------------------------------------------- |
+| **S3** (5 buckets)                    | Data Lake (bronze/silver/gold/scripts/athena) | Armazenamento barato, durável e desacoplado da computação                                           |
+| **AWS Glue (PySpark)**                | ETL batch e streaming                         | Serverless (paga por job), integrado ao Data Catalog, escala sem gestão de cluster                  |
+| **Amazon MSK**                        | Broker Kafka do streaming                     | Kafka gerenciado; padrão de mercado para ingestão de eventos; PLAINTEXT :9092 conforme lab do curso |
+| **Lambda + EventBridge**              | Producer de eventos agendado                  | Custo por invocação; simula fontes emitindo atualizações a cada 5 min                               |
+| **Step Functions**                    | Orquestração do streaming                     | Controla o ciclo start→wait→stop→crawler sem servidor e com retry/catch nativos                     |
+| **Glue Data Catalog + Crawlers**      | Governança/metadados                          | Catálogo central de schemas; descoberta automática de partições                                     |
+| **Athena**                            | Camada de consulta                            | SQL serverless sobre Parquet particionado; paga por byte escaneado                                  |
+| **AWS CLI (`setup.sh`/`cleanup.sh`)** | IaC                                           | Reproduzível; ciclo criar/destruir explícito                                                        |
 
-```bash
-export LAKE_URI=s3a://meu-bucket/datalake
-export AWS_ACCESS_KEY_ID=...
-export AWS_SECRET_ACCESS_KEY=...
-export AWS_SESSION_TOKEN=...     # só para credenciais temporárias (AWS Academy)
-export AWS_REGION=us-east-1
-python pipeline_medalhao.py batch
-```
+## 7. Decisões arquiteturais (trade-offs)
 
-No Windows tem o modelo `rodar_aws.example.ps1` — copiar para `rodar_aws.ps1`, preencher as credenciais e executar (esse arquivo está no .gitignore para as chaves nunca irem pro repositório).
+**Batch vs Streaming** — os indicadores oficiais mudam poucas vezes ao ano: batch é mais barato e simples para a carga histórica. Novas medições, porém, chegam continuamente: streaming via Kafka dá latência de segundos. A arquitetura híbrida usa cada modo onde ele é mais eficiente, convergindo tudo para o mesmo Data Lake.
 
-Testamos a ingestão completa no S3: o pipeline gravou as camadas bronze, silver e gold direto no bucket, com os 9 checks de qualidade aprovados. Numa evolução em produção, o batch rodaria agendado no EMR Serverless (ou Glue) via EventBridge.
+**Data Lake vs Data Warehouse** — optamos por Data Lake (S3 + Parquet + Athena) em vez de um DW dedicado (ex.: Redshift): custo de armazenamento ~10x menor, schema-on-read flexível para fontes heterogêneas e nenhum cluster ligado 24/7. O trade-off é menor performance em joins massivos — irrelevante no volume atual (~35 mil linhas batch).
 
-## 5. Tecnologias e justificativas
+**Custo vs Performance** — 2 workers G.1X nos jobs Glue e MSK `kafka.t3.small` × 2 são o mínimo funcional; escalam via parâmetro se o volume crescer. O streaming roda em janelas controladas (Step Functions para o job após 5 min) em vez de 24/7 — corta ~99% do custo de um consumer contínuo, ao custo de latência entre janelas.
 
-- **PySpark** — mesma API para batch e streaming, e o mesmo código escala do notebook para um cluster EMR sem reescrever nada.
-- **Parquet** — formato colunar comprimido; ocupa muito menos espaço que CSV e as consultas analíticas leem só as colunas necessárias.
-- **AWS S3** — armazenamento barato e durável para o data lake; as camadas são só prefixos no bucket.
-- **Structured Streaming** — processamento em micro-lotes com checkpoint (se o job cair, retoma de onde parou sem duplicar).
-- **INEP / Base dos Dados** — fontes oficiais e reprodutíveis do indicador.
-- **CloudWatch (opcional)** — com `ENABLE_CLOUDWATCH=1` as métricas de cada etapa vão para a AWS, onde dá pra criar alarmes.
+**Glue Structured Streaming vs Lambda consumer** — o consumer em Spark dá checkpointing (*exactly-once*), particionamento nativo e o mesmo runtime do batch; uma Lambda consumer exigiria Event Source Mapping, controle manual de offsets e teto de 15 min por execução.
 
-## 6. Decisões arquiteturais (trade-offs)
+## 8. Governança e qualidade de dados
 
-- **Batch vs streaming**: resultados e metas oficiais mudam no máximo 1x por ano, então batch resolve com custo mínimo. Já novas medições de desempenho fazem sentido como fluxo contínuo — usamos micro-lotes de 5s porque "tempo quase real" atende o caso educacional; latência menor que isso só aumentaria o custo.
-- **Data lake vs data warehouse**: escolhemos lake (S3 + Parquet) pelo custo baixo e pela flexibilidade de adicionar novas fontes (Censo Escolar, PNAD) sem migração de schema. Um warehouse como Redshift só se justificaria com muita concorrência de BI.
-- **Custo vs performance**: o volume atual é pequeno (5,5 mil municípios), então configuramos poucas partições de shuffle (8 em vez das 200 padrão) e usamos `coalesce(1)` nos relatórios para não gerar centenas de arquivos minúsculos no S3. A gold de municípios é particionada por UF, que é o filtro mais comum nas consultas.
-- **Arquivo único**: todo o pipeline está em `pipeline_medalhao.py` para facilitar a correção e o deploy (spark-submit de um arquivo só), com a separação das camadas feita por funções.
+- **Duplicidade**: hash MD5 das colunas de negócio no Bronze; deduplicação no Silver.
+- **Valores ausentes**: regras `_dq_*` por entidade (nulos em chaves e métricas obrigatórias).
+- **Validação de chaves**: `id_municipio` com 7 dígitos IBGE; `sigla_uf` válida; domínio de `rede` (0/2/3/5).
+- **Consistência entre tabelas**: joins de conferência indicador × metas (queries 1–5 de `validacao_gold.sql`).
+- **Quarentena**: registro reprovado não é descartado — vai para `sot/quarentena/` com `_quarentena_motivo` (`concat_ws` das regras violadas), permitindo auditoria e reprocesso.
+- **Catálogo**: schemas centralizados no Glue Data Catalog; partições descobertas por crawler.
 
-## 7. Monitoramento
+## 9. Monitoramento
 
-Cada etapa registra quantas linhas processou, quanto tempo levou e o status (OK/FALHA). Essas métricas são salvas em `monitoramento/execucoes/` no lake e, opcionalmente, enviadas ao CloudWatch (namespace `PipelineAlfabetizacao`), onde dá pra criar alarme de falha ou de volume zerado. O relatório de qualidade em `qualidade/relatorios/` serve como trilha de auditoria.
+- **CloudWatch Logs**: todos os jobs Glue e a Lambda logam automaticamente; cada job ETL imprime um **SUMÁRIO** final com contagens de entrada, pass e quarentena por entidade — falha de ingestão e volume processado ficam visíveis por execução.
+- **CloudWatch Metrics**: métricas nativas de Glue (DPU, records), MSK (bytes in/out por broker) e Lambda (erros, duração) — base para alarmes de erro/latência.
+- **Step Functions**: o console mostra o estado de cada etapa do streaming (start/wait/stop/crawler), com `Catch` para falhas no stop do job.
+- **Job bookmark** no Glue evita reprocessar dados já lidos no batch.
+- **Checkpoint** do Structured Streaming garante retomada sem perda/duplicação após falha.
 
-## 8. FinOps – controle de custos
+## 10. FinOps — otimização de custos
 
-- Parquet comprimido em todas as camadas (JSON só na landing, que é o formato de chegada dos eventos);
-- Particionamento por data (bronze) e por UF (gold) — as consultas leem só as partições necessárias;
-- Poucos arquivos grandes em vez de muitos pequenos (menos requests no S3);
-- Limite configurável na ingestão dos microdados de alunos, para não estourar a cota gratuita do BigQuery (1 TB/mês);
-- Estimativa com os volumes atuais (batch diário + streaming 1h/dia): S3 < 1 GB ≈ US$ 0,03/mês; EMR Serverless ≈ US$ 2–5/mês; CloudWatch ≈ US$ 0,30/mês. **Total abaixo de US$ 6/mês.**
+- **Parquet + particionamento** (`anomesdia` no batch; `year/month/day/hour` no streaming): Athena escaneia só o necessário — colunar + partição corta o custo por query em ordem de grandeza vs CSV.
+- **Athena workgroup com cutoff de 1 GB** por query: proteção contra full-scan acidental.
+- **S3 Lifecycle no Bronze**: Standard → Standard-IA (30 dias) → Glacier (90 dias).
+- **S3 VPC Gateway Endpoint**: tráfego Glue↔S3 sem custo de NAT.
+- **Streaming em janelas**: Step Functions para o job Glue após 5 min; EventBridge produz eventos só a cada 5 min.
+- **Dimensionamento mínimo**: 2× G.1X no Glue, `kafka.t3.small` × 2 com 10 GB EBS, Lambda 256 MB.
+- **`cleanup.sh`**: destrói tudo ao fim de cada sessão — o projeto não deixa custo residual.
 
-## 9. Aplicação em IA
+**Estimativa de custo (us-east-1, sessão de testes de ~2h):**
 
-A camada Gold já sai pronta para:
+| Recurso | Custo aproximado |
+|---|---|
+| MSK 2× kafka.t3.small + EBS | ~US$ 0,15/h → US$ 0,30 |
+| Glue jobs (4 execuções × 2 DPU × ~10 min) | ~US$ 0,60 |
+| Athena (queries em ~10 MB Parquet) | < US$ 0,01 |
+| S3 (< 100 MB) + Lambda + Step Functions + EventBridge | centavos |
+| **Total por sessão** | **~US$ 1** |
 
-- **Predição de alfabetização**: a tabela de municípios (taxa, metas, gaps, participação, nível) é uma matriz de features; enriquecendo com Censo Escolar e dados socioeconômicos dá pra treinar um modelo que preveja o indicador do próximo ano e aponte municípios em risco de não cumprir a meta.
-- **Análise de desigualdade**: clusterização dos municípios (por taxa, gap e diferença para a média da UF) revela grupos de vulnerabilidade educacional, inclusive dentro de um mesmo estado.
-- **Políticas públicas baseadas em dados**: o resumo metas × resultados mostra onde a meta está descolada da realidade e a evolução 2021 → 2023 mede a recuperação pós-pandemia, ajudando a priorizar investimento.
+## 11. Aplicação em IA
 
-## 10. Estrutura do repositório
+A camada Gold sai pronta para consumo analítico e de ML:
 
-```
-├── pipeline_medalhao.py     # pipeline completo (bronze/silver/gold + qualidade + streaming)
-├── rodar_aws.example.ps1    # modelo p/ rodar na AWS (copiar p/ rodar_aws.ps1 e preencher)
-├── .gitignore               # protege credenciais e dados gerados
-├── README.md
-├── dados_fonte/             # (gerado) xlsx baixados do INEP
-└── datalake/                # (gerado) bronze/ silver/ gold/ qualidade/ monitoramento/
-```
+- **Modelos de predição de alfabetização**: `alfabetizacao_por_municipio` (taxa, gap, nível, série, rede) é uma tabela de features por município/ano; enriquecida com dados socioeconômicos (IBGE/Censo, FUNDEB), suporta regressão da taxa futura e classificação de municípios em risco de não atingir a meta 2030 — a flag `risco_alfabetizacao` do streaming já antecipa esse rótulo em tempo quase real.
+- **Análise de desigualdade educacional**: `evolucao_temporal` e `ranking_municipios` permitem medir dispersão intra-UF (desvio-padrão por UF/ano) e clusterizar municípios por vulnerabilidade educacional (ex.: K-means sobre taxa × gap × proporções por nível de proficiência).
+- **Políticas públicas baseadas em dados**: `comparacao_metas_nacionais` responde diretamente "quais UFs estão fora da trajetória da meta?" — priorização objetiva de investimento; o histórico preservado no Bronze permite avaliar efeito de intervenções ao longo do tempo.
