@@ -1,14 +1,15 @@
 # credenciais - NUNCA commitar
 rodar_aws.ps1
+.env
+*.pem
 
-# dados gerados pelo pipeline (recriados a cada execucao)
-datalake/
+# artefatos de build/deploy (gerados localmente)
+kafka_layer.zip
+producer.zip
 
-# dados brutos baixados automaticamente pelo pipeline
-dados_fonte/
-
-# editor
+# editor / SO
 .vscode/
+.DS_Store
 
 # python
 __pycache__/
