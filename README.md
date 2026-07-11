@@ -215,7 +215,3 @@ A camada Gold sai pronta para consumo analítico e de ML:
 - **Modelos de predição de alfabetização**: `alfabetizacao_por_municipio` (taxa, gap, nível, série, rede) é uma tabela de features por município/ano; enriquecida com dados socioeconômicos (IBGE/Censo, FUNDEB), suporta regressão da taxa futura e classificação de municípios em risco de não atingir a meta 2030 — a flag `risco_alfabetizacao` do streaming já antecipa esse rótulo em tempo quase real.
 - **Análise de desigualdade educacional**: `evolucao_temporal` e `ranking_municipios` permitem medir dispersão intra-UF (desvio-padrão por UF/ano) e clusterizar municípios por vulnerabilidade educacional (ex.: K-means sobre taxa × gap × proporções por nível de proficiência).
 - **Políticas públicas baseadas em dados**: `comparacao_metas_nacionais` responde diretamente "quais UFs estão fora da trajetória da meta?" — priorização objetiva de investimento; o histórico preservado no Bronze permite avaliar efeito de intervenções ao longo do tempo.
-
-## 12. Fluxo de trabalho Git
-
-Desenvolvimento em branches de funcionalidade (`feature/pipeline-batch`, `feature/streaming`, `feature/integracao-aws`, `feature/documentacao`, `damasceno`) integradas à `main` via Pull Requests com histórico de commits descritivos.
