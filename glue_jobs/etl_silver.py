@@ -1,8 +1,22 @@
 """
 Glue Job — Bronze → Silver (SOT)
-Lê partição Bronze do dia, aplica transformações por entidade,
-executa DQ como colunas booleanas (_dq_*) e roteia registros
-para PASS ou QUARENTENA com _quarentena_motivo.
+Lê o histórico completo de cada entidade Bronze (todas as partições
+ano=YYYY), aplica transformações por entidade, executa DQ como colunas
+booleanas (_dq_*) e roteia registros para PASS ou QUARENTENA com
+_quarentena_motivo.
+
+Estratégia de particionamento:
+  - PASS: particionado por `ano` (sot/pass/<entidade>/ano=YYYY/),
+    espelhando o Bronze — partition pruning nas queries e reprocesso
+    idempotente por ano via partitionOverwriteMode=dynamic.
+  - QUARENTENA: particionada por data de processamento (anomesdia=YYYYMMDD),
+    pois é trilha de auditoria: registros reprovados podem ter `ano` nulo ou
+    inválido (justamente o motivo da reprovação), o que inviabiliza `ano`
+    como chave física de partição.
+  - Processamos o histórico completo a cada execução por decisão do time:
+    o volume é pequeno (~35 mil linhas) e o indicador exige comparação
+    entre anos; o custo de reprocessar tudo é menor que o risco de
+    inconsistência entre partições processadas em datas diferentes.
 
 Padrões do curso aplicados:
   - TRANSFORMACOES dict: função de transformação por entidade
@@ -213,10 +227,12 @@ def separar_e_salvar_sot(df_dq, entidade):
         .withColumn("_quarentena_ts",     F.lit(INGESTION_TS))
     )
 
-    pass_path = f"s3://{BUCKET_SOT}/sot/pass/{entidade}/anomesdia={ANOMESDIA}/"
+    # PASS particionado por ano (Hive-style); QUARENTENA por data de
+    # processamento — ver racional no docstring do módulo.
+    pass_path = f"s3://{BUCKET_SOT}/sot/pass/{entidade}/"
     quar_path = f"s3://{BUCKET_SOT}/sot/quarentena/{entidade}/anomesdia={ANOMESDIA}/"
 
-    df_pass.write.mode("overwrite").parquet(pass_path)
+    df_pass.write.mode("overwrite").partitionBy("ano").parquet(pass_path)
     df_quar.write.mode("overwrite").parquet(quar_path)
 
     n_pass = df_pass.count()
@@ -236,9 +252,11 @@ resultados = {}
 for ENTIDADE, fn_transf in TRANSFORMACOES.items():
     log.info(f"[SILVER] Iniciando: {ENTIDADE}")
 
-    origem = f"s3://{BUCKET_SOR}/bronze/{ENTIDADE}/anomesdia={ANOMESDIA}/"
+    # Leitura de TODAS as partições ano=YYYY da entidade — o indicador
+    # exige o histórico completo para comparações entre anos.
+    origem = f"s3://{BUCKET_SOR}/bronze/{ENTIDADE}/"
     df = spark.read.parquet(origem)
-    log.info(f"[SILVER] {ENTIDADE}: {df.count()} registros lidos do Bronze")
+    log.info(f"[SILVER] {ENTIDADE}: {df.count()} registros lidos do Bronze (todas as partições de ano)")
 
     # Transformação
     df_transf = fn_transf(df)
