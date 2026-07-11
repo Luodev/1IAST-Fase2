@@ -143,7 +143,7 @@ echo ">>> [1/10] Criando Security Group..."
 
 export SG_ID=$(aws ec2 create-security-group \
   --group-name $SG_NAME \
-  --description "SG MSK + Glue workers — ${PROJECT}" \
+  --description "SG MSK + Glue workers - ${PROJECT}" \
   --vpc-id $VPC_ID \
   --region $AWS_REGION --query 'GroupId' --output text)
 
@@ -523,7 +523,7 @@ echo "    --targets Id=1,Arn=arn:aws:lambda:$AWS_REGION:$ID_CONTA:function:${PRO
 # Step Functions — orquestra Glue Streaming + Crawler
 SFN_DEF=$(cat << SFN
 {
-  "Comment": "Pipeline streaming: Glue Job → Aguarda → Para → Crawler",
+  "Comment": "Pipeline streaming: Glue Job -> Aguarda -> Para -> Crawler",
   "StartAt": "IniciarGlueStreaming",
   "States": {
     "IniciarGlueStreaming": {
