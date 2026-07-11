@@ -35,9 +35,9 @@ O streaming simula a chegada de **atualizações de indicadores em tempo quase r
 flowchart LR
     subgraph BATCH
         CSV[CSVs INEP<br/>dados/] -->|setup.sh seção 10| RAW[(S3 Bronze<br/>/raw)]
-        RAW -->|Glue: etl_bronze.py| BR[(S3 Bronze<br/>/bronze — Parquet)]
-        BR -->|Glue: etl_silver.py<br/>DQ pass/quarentena| SV[(S3 Silver<br/>/sot)]
-        SV -->|Glue: etl_gold.py<br/>4 visões analíticas| GD[(S3 Gold<br/>/gold)]
+        RAW -->|Glue: etl_bronze.py| BR[(S3 Bronze<br/>/bronze — Parquet<br/>part. ano=YYYY)]
+        BR -->|Glue: etl_silver.py<br/>DQ pass/quarentena| SV[(S3 Silver<br/>/sot<br/>part. ano=YYYY)]
+        SV -->|Glue: etl_gold.py<br/>4 visões analíticas| GD[(S3 Gold<br/>/gold<br/>part. ano=YYYY)]
     end
 
     subgraph STREAMING
@@ -58,9 +58,9 @@ flowchart LR
 ### Fluxo de dados (Arquitetura Medalhão)
 
 1. **RAW** — os 5 CSVs do INEP são enviados a `s3://alfabetizacao-br-dev-bronze/raw/` (seção 10 do `setup.sh`).
-2. **Bronze (SOR)** — `etl_bronze.py` lê os CSVs com **schemas explícitos**, adiciona colunas de controle (hash MD5 para deduplicação, timestamp de ingestão) e grava **Parquet** particionado por `anomesdia`, preservando o histórico completo.
-3. **Silver (SOT)** — `etl_silver.py` aplica limpeza, padronização de tipos, normalização de chaves (`id_municipio` com 7 dígitos, mapa de redes 0/2/3/5 → total/estadual/municipal/privada) e as **regras de qualidade** (colunas booleanas `_dq_*` consolidadas em `_dq_passou`). Registros aprovados vão para `sot/pass/`; reprovados vão para `sot/quarentena/` com `_quarentena_motivo`. É aqui que as bases são integradas.
-4. **Gold (SPEC)** — `etl_gold.py` produz 4 visões analíticas prontas para consumo:
+2. **Bronze (SOR)** — `etl_bronze.py` lê os CSVs com **schemas explícitos**, adiciona colunas de controle (hash MD5 para deduplicação, timestamp de ingestão) e grava **Parquet particionado por ano** (Hive-style: `bronze/<entidade>/ano=2023/`, `ano=2024/`, ...), preservando o histórico completo de todos os ciclos avaliativos.
+3. **Silver (SOT)** — `etl_silver.py` lê **todas as partições de ano** do Bronze, aplica limpeza, padronização de tipos, normalização de chaves (`id_municipio` com 7 dígitos, mapa de redes 0/2/3/5 → total/estadual/municipal/privada) e as **regras de qualidade** (colunas booleanas `_dq_*` consolidadas em `_dq_passou`). Registros aprovados vão para `sot/pass/<entidade>/ano=YYYY/`; reprovados vão para `sot/quarentena/` (particionada pela data de processamento, pois o próprio `ano` pode ser o campo inválido) com `_quarentena_motivo`. É aqui que as bases são integradas.
+4. **Gold (SPEC)** — `etl_gold.py` produz 4 visões analíticas prontas para consumo, cada uma particionada por ano (`gold/<visao>/ano=YYYY/`):
 
 | Visão | Descrição |
 |---|---|
@@ -75,25 +75,37 @@ flowchart LR
 ## 4. Estrutura do repositório
 
 ```
-├── setup.sh                     # Provisiona toda a infra via AWS CLI (10 seções)
-├── cleanup.sh                   # Remove todos os recursos (FinOps!)
-├── dados/                       # 5 CSVs reais do INEP (Base dos Dados)
+├── .env.example                      # Modelo das variáveis de ambiente do AWS CLI
+├── setup.sh                          # Provisiona toda a infra via AWS CLI (10 seções)
+├── cleanup.sh                        # Remove todos os recursos (FinOps!)
+├── verificar_limpeza.sh              # Audita se o cleanup.sh removeu tudo (somente leitura)
+├── dados/                            # 5 CSVs reais do INEP (Base dos Dados)
 ├── glue_jobs/
-│   ├── etl_bronze.py            # RAW (CSV) → Bronze (Parquet + hash de deduplicação)
-│   ├── etl_silver.py            # Bronze → Silver (DQ, pass/quarentena, integração)
-│   ├── etl_gold.py              # Silver → Gold (4 visões analíticas)
-│   └── streaming_glue.py        # MSK → S3 via Spark Structured Streaming
+│   ├── etl_bronze.py                 # RAW (CSV) → Bronze (Parquet part. ano=YYYY + hash dedup)
+│   ├── etl_silver.py                 # Bronze → Silver (DQ, pass/quarentena, integração)
+│   ├── etl_gold.py                   # Silver → Gold (4 visões analíticas part. ano=YYYY)
+│   └── streaming_glue.py             # MSK → S3 via Spark Structured Streaming
 ├── lambda_functions/
-│   └── streaming_producer.py    # Publica eventos sintéticos no MSK (confluent-kafka)
+│   └── streaming_producer.py         # Publica eventos sintéticos no MSK (confluent-kafka)
+├── notebooks/
+│   ├── 01_analise_exploratoria.ipynb # EDA das 5 bases INEP (fundamenta as decisões da pipeline)
+│   ├── 02_idempotencia_bronze.ipynb  # Verificação de idempotência — camada Bronze
+│   ├── 03_idempotencia_silver.ipynb  # Verificação de idempotência — camada Silver
+│   ├── 04_idempotencia_gold.ipynb    # Verificação de idempotência — camada Gold
+│   └── pipeline_local.py             # Simulação local fiel dos 3 jobs Glue (pandas)
 └── athena_queries/
-    └── validacao_gold.sql       # Validações de qualidade + queries analíticas
+    └── validacao_gold.sql            # Validações de qualidade + queries analíticas
 ```
 
 ## 5. Como executar
 
-Pré-requisitos: AWS CLI configurada (`aws configure`) com permissão de administrador, `python3` e `pip`.
+Pré-requisitos: AWS CLI com credenciais de administrador (`aws configure` ou `cp .env.example .env` + `source .env`), `python3` e `pip`.
 
 ```bash
+# 0. Credenciais (alternativa ao aws configure)
+cp .env.example .env   # preencha com suas credenciais
+source .env
+
 # 1. Provisionar a infraestrutura (~25 min; MSK leva ~15 min para ficar ACTIVE)
 bash setup.sh
 
@@ -115,7 +127,12 @@ aws stepfunctions start-execution --state-machine-arn <ARN> --input '{...}'
 
 # 6. AO TERMINAR — remover tudo para não gerar custo
 bash cleanup.sh
+
+# 7. Auditar a limpeza (somente leitura; ❌ indica recurso remanescente)
+bash verificar_limpeza.sh
 ```
+
+Os notebooks de `notebooks/` rodam localmente (sem AWS): `pip install pandas pyarrow matplotlib seaborn` e execute-os pelo Jupyter/VS Code. Eles documentam a EDA que fundamentou o desenho da pipeline e provam a idempotência dos scripts de preparação de cada camada.
 
 ## 6. Tecnologias utilizadas e justificativas
 
@@ -128,7 +145,7 @@ bash cleanup.sh
 | **Step Functions**                    | Orquestração do streaming                     | Controla o ciclo start→wait→stop→crawler sem servidor e com retry/catch nativos                     |
 | **Glue Data Catalog + Crawlers**      | Governança/metadados                          | Catálogo central de schemas; descoberta automática de partições                                     |
 | **Athena**                            | Camada de consulta                            | SQL serverless sobre Parquet particionado; paga por byte escaneado                                  |
-| **AWS CLI (`setup.sh`/`cleanup.sh`)** | IaC                                           | Reproduzível; ciclo criar/destruir explícito                                                        |
+| **AWS CLI (`setup.sh`/`cleanup.sh`)** | IaC                                           | Menos complexidade que Terraform (sem state remoto nem providers); cada recurso é um comando legível e o ciclo criar → verificar → destruir é explícito. Padrão do lab FIAP |
 
 ## 7. Decisões arquiteturais (trade-offs)
 
@@ -140,6 +157,10 @@ bash cleanup.sh
 
 **Glue Structured Streaming vs Lambda consumer** — o consumer em Spark dá checkpointing (*exactly-once*), particionamento nativo e o mesmo runtime do batch; uma Lambda consumer exigiria Event Source Mapping, controle manual de offsets e teto de 15 min por execução.
 
+**Particionamento por ano (`ano=YYYY`) vs pastas soltas por ano** — a base cresce um ciclo avaliativo por ano; em vez de pastas manuais, usamos particionamento Hive-style dentro de cada camada (`bronze/<entidade>/ano=2023/` etc.). Ganhos: *partition pruning* no Athena (`WHERE ano = 2024` lê só aquela partição — menos custo), reprocesso idempotente por ano via `partitionOverwriteMode=dynamic` (provado nos notebooks 02–04) e novos ciclos entram como partições novas, sem tocar o histórico. Mantemos **todo o histórico disponível**: indicador só faz sentido em comparação entre anos, e o volume (~35 mil linhas/ciclo em Parquet) custa centavos.
+
+**AWS CLI vs Terraform** — escolha consciente para **diminuir a complexidade da pipeline**: Terraform exigiria state remoto, providers e uma camada de abstração que não se paga num projeto de ambiente único e efêmero (a infra sobe para a demonstração e é destruída em seguida). Com a CLI, cada recurso é um comando explícito e didático; a recuperação de estado usa a seção *sessão perdida* do `setup.sh` e a auditoria fica com o `verificar_limpeza.sh`. Trade-off assumido: sem plan declarativo nem detecção de drift — irrelevante sem ambiente de longa duração. Com múltiplos ambientes e infra permanente, Terraform seria a escolha certa.
+
 ## 8. Governança e qualidade de dados
 
 - **Duplicidade**: hash MD5 das colunas de negócio no Bronze; deduplicação no Silver.
@@ -148,6 +169,7 @@ bash cleanup.sh
 - **Consistência entre tabelas**: joins de conferência indicador × metas (queries 1–5 de `validacao_gold.sql`).
 - **Quarentena**: registro reprovado não é descartado — vai para `sot/quarentena/` com `_quarentena_motivo` (`concat_ws` das regras violadas), permitindo auditoria e reprocesso.
 - **Catálogo**: schemas centralizados no Glue Data Catalog; partições descobertas por crawler.
+- **Idempotência verificada**: os notebooks [`02`](notebooks/02_idempotencia_bronze.ipynb), [`03`](notebooks/03_idempotencia_silver.ipynb) e [`04`](notebooks/04_idempotencia_gold.ipynb) executam cada camada duas vezes sobre o mesmo insumo e comparam partições, contagens e hashes de conteúdo — garantia de que retries e reprocessos não duplicam nem corrompem o lake.
 
 ## 9. Monitoramento
 
@@ -159,13 +181,13 @@ bash cleanup.sh
 
 ## 10. FinOps — otimização de custos
 
-- **Parquet + particionamento** (`anomesdia` no batch; `year/month/day/hour` no streaming): Athena escaneia só o necessário — colunar + partição corta o custo por query em ordem de grandeza vs CSV.
+- **Parquet + particionamento por ano** (`ano=YYYY` nas três camadas do batch; `year/month/day/hour` no streaming): o formato colunar reduz o volume lido por coluna e o *partition pruning* limita a leitura aos anos filtrados — como as análises do indicador são tipicamente por ciclo (`WHERE ano = 2024`), o custo por query cai em ordem de grandeza vs CSV sem partição, e cresce de forma controlada conforme novos anos entram na base.
 - **Athena workgroup com cutoff de 1 GB** por query: proteção contra full-scan acidental.
 - **S3 Lifecycle no Bronze**: Standard → Standard-IA (30 dias) → Glacier (90 dias).
 - **S3 VPC Gateway Endpoint**: tráfego Glue↔S3 sem custo de NAT.
 - **Streaming em janelas**: Step Functions para o job Glue após 5 min; EventBridge produz eventos só a cada 5 min.
 - **Dimensionamento mínimo**: 2× G.1X no Glue, `kafka.t3.small` × 2 com 10 GB EBS, Lambda 256 MB.
-- **`cleanup.sh`**: destrói tudo ao fim de cada sessão — o projeto não deixa custo residual.
+- **`cleanup.sh` + `verificar_limpeza.sh`**: destruição completa ao fim de cada sessão, com auditoria automática de recursos remanescentes — o projeto não deixa custo residual.
 
 **Estimativa de custo (us-east-1, sessão de testes de ~2h):**
 
