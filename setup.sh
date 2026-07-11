@@ -44,6 +44,17 @@ export SFN_ROLE=StepFunctionsRole-${PROJECT}
 export VPC_NAME=${PROJECT}-vpc
 export SG_NAME=${PROJECT}-msk-sg
 
+# -----------------------------------------------------------------------------
+# MODO DE EXECUÇÃO — a arquitetura ideal é HÍBRIDA (batch + streaming via MSK).
+# Contas AWS Academy Learner Lab bloqueiam kafka:CreateCluster; nelas o script
+# executa apenas o pipeline BATCH (S3 + Glue + Athena), que funciona integral-
+# mente. O código de streaming permanece no repositório como arquitetura alvo.
+#   STREAMING=auto  → detecta o ambiente (padrão)
+#   STREAMING=on    → força provisionar MSK/streaming
+#   STREAMING=off   → força modo batch-only
+# -----------------------------------------------------------------------------
+export STREAMING="${STREAMING:-auto}"
+
 echo "============================================================"
 echo "  Projeto  : $PROJECT ($ENV)"
 echo "  Conta    : $ID_CONTA"
@@ -204,6 +215,7 @@ if aws iam get-role --role-name LabRole --region $AWS_REGION >/dev/null 2>&1; th
   export SFN_ROLE_ARN=$GLUE_ROLE_ARN
   echo "  ⚠️  Ambiente Learner Lab detectado (iam:CreateRole indisponível)."
   echo "  Usando LabRole para Glue, Lambda e Step Functions: $GLUE_ROLE_ARN"
+  LEARNER_LAB=true
 
 else
 
@@ -259,12 +271,30 @@ echo "  Step Functions Role: $SFN_ROLE_ARN"
 
 fi
 
+# Resolve o modo de execução (ver bloco MODO DE EXECUÇÃO no topo do script)
+if [ "$STREAMING" = "auto" ]; then
+  if [ "${LEARNER_LAB:-false}" = "true" ]; then
+    STREAMING=off
+    echo ""
+    echo "  ⚠️  O Learner Lab também bloqueia kafka:CreateCluster (MSK)."
+    echo "      Executando em MODO BATCH-ONLY. Para forçar: STREAMING=on bash setup.sh"
+  else
+    STREAMING=on
+  fi
+fi
+echo ""
+echo "  Modo de execução: $([ "$STREAMING" = "on" ] && echo 'HÍBRIDO (batch + streaming)' || echo 'BATCH-ONLY (streaming desativado)')"
+
 # =============================================================================
 # 4. CLUSTER MSK (PLAINTEXT, kafka.t3.small × 2)
 # =============================================================================
 # ⏱️ Esta etapa leva ~15 minutos. Passe para a seção 5 enquanto aguarda.
 echo ""
 echo ">>> [4/10] Criando cluster MSK... (aguarde ~15 min)"
+
+if [ "$STREAMING" = "off" ]; then
+  echo "  (pulado — modo batch-only)"
+else
 
 aws kafka create-cluster \
   --cluster-name $MSK_CLUSTER_NAME \
@@ -281,6 +311,8 @@ aws kafka create-cluster \
 
 echo "  MSK criando... verifique com:"
 echo "  aws kafka list-clusters --region $AWS_REGION --query \"ClusterInfoList[?ClusterName=='$MSK_CLUSTER_NAME'].State\" --output text"
+
+fi
 
 # =============================================================================
 # 5. UPLOAD DOS SCRIPTS GLUE PARA S3
@@ -357,6 +389,9 @@ echo "  Job: ${PROJECT}-silver-to-gold"
 # Glue Streaming Job (Spark Structured Streaming — aguarda MSK estar ACTIVE)
 # O parâmetro --msk_bootstrap_servers é atualizado na seção 8, quando o MSK
 # estiver ACTIVE e o bootstrap broker for conhecido.
+if [ "$STREAMING" = "off" ]; then
+  echo "  (job de streaming pulado — modo batch-only)"
+else
 aws glue create-job \
   --name "${PROJECT}-streaming" \
   --role $GLUE_ROLE_ARN \
@@ -373,6 +408,7 @@ aws glue create-job \
   }" \
   --region $AWS_REGION > /dev/null
 echo "  Job: ${PROJECT}-streaming (msk_bootstrap_servers será atualizado na seção 8)"
+fi
 
 # Crawler Gold
 aws glue create-crawler \
@@ -382,6 +418,9 @@ aws glue create-crawler \
   --targets "{\"S3Targets\":[{\"Path\":\"s3://$BUCKET_GOLD/gold/\"}]}" \
   --region $AWS_REGION 2>/dev/null || true
 echo "  Crawler: ${PROJECT}-gold-crawler"
+
+# Crawler Streaming + Network Connection — apenas no modo híbrido
+if [ "$STREAMING" = "on" ]; then
 
 # Crawler Streaming (aponta para o path onde o streaming_glue.py grava)
 aws glue create-crawler \
@@ -408,11 +447,16 @@ aws glue create-connection --connection-input "{
 }" --region $AWS_REGION 2>/dev/null || true
 echo "  Glue Network Connection: ${PROJECT}-msk-connection"
 
+fi
+
 # =============================================================================
 # 7. LAMBDA — PRODUCER (batch ingestor é opcional, rode manualmente)
 # =============================================================================
 echo ""
 echo ">>> [7/10] Criando Lambda Producer..."
+if [ "$STREAMING" = "off" ]; then
+  echo "  (pulado — modo batch-only)"
+else
 echo "  ATENÇÃO: o Layer confluent-kafka precisa ser criado antes (veja README)."
 echo "  Execute os passos abaixo separadamente:"
 echo ""
@@ -447,12 +491,17 @@ echo ""
 #   --region $AWS_REGION
 
 echo "  (Lambda comentada — preencha LAYER_ARN e MSK_BOOTSTRAP_SERVERS após MSK ficar ACTIVE)"
+fi
 
 # =============================================================================
 # 8. AGUARDAR MSK E CAPTURAR BOOTSTRAP
 # =============================================================================
 echo ""
 echo ">>> [8/10] Aguardando MSK ficar ACTIVE..."
+
+if [ "$STREAMING" = "off" ]; then
+  echo "  (pulado — modo batch-only)"
+else
 
 while true; do
   STATE=$(aws kafka list-clusters --region $AWS_REGION \
@@ -499,11 +548,16 @@ echo "    --function-name ${PROJECT}-producer \\"
 echo "    --environment \"Variables={MSK_BOOTSTRAP_SERVERS=$BOOTSTRAP,KAFKA_TOPIC=$MSK_TOPIC,MENSAGENS_POR_INVOCACAO=10}\" \\"
 echo "    --region $AWS_REGION"
 
+fi
+
 # =============================================================================
 # 9. EVENTBRIDGE + STEP FUNCTIONS + ATHENA
 # =============================================================================
 echo ""
 echo ">>> [9/10] Criando EventBridge, Step Functions e Athena..."
+
+# EventBridge e Step Functions orquestram o streaming — apenas no modo híbrido
+if [ "$STREAMING" = "on" ]; then
 
 # EventBridge — agenda a Lambda Producer a cada 5 minutos
 aws events put-rule \
@@ -576,6 +630,10 @@ aws stepfunctions create-state-machine \
   --region $AWS_REGION > /dev/null
 echo "  Step Functions: ${PROJECT}-streaming-orchestrator"
 
+else
+  echo "  (EventBridge e Step Functions pulados — modo batch-only)"
+fi
+
 # Athena Workgroup
 aws athena create-work-group \
   --name "${PROJECT}-workgroup" \
@@ -625,3 +683,37 @@ echo ""
 echo "============================================================"
 echo "  ✅ Infraestrutura provisionada com sucesso!"
 echo ""
+if [ "$STREAMING" = "on" ]; then
+  echo "  BOOTSTRAP MSK : ${BOOTSTRAP:-verifique a seção 8}"
+fi
+echo "  Modo          : $([ "$STREAMING" = "on" ] && echo 'HÍBRIDO (batch + streaming)' || echo 'BATCH-ONLY')"
+echo "  Bronze bucket : s3://$BUCKET_BRONZE"
+echo "  Silver bucket : s3://$BUCKET_SILVER"
+echo "  Gold bucket   : s3://$BUCKET_GOLD"
+echo ""
+echo "  PRÓXIMOS PASSOS:"
+echo "  1. Execute o pipeline batch (aguarde cada job concluir):"
+echo "     aws glue start-job-run --job-name ${PROJECT}-raw-to-bronze"
+echo "     aws glue start-job-run --job-name ${PROJECT}-bronze-to-silver"
+echo "     aws glue start-job-run --job-name ${PROJECT}-silver-to-gold"
+echo "     aws glue start-crawler --name ${PROJECT}-gold-crawler"
+if [ "$STREAMING" = "on" ]; then
+  echo "  2. Crie o Lambda Layer e descomente a seção 7 deste script"
+  echo "  3. Atualize MSK_BOOTSTRAP_SERVERS na Lambda Producer"
+  echo "  4. Execute o pipeline streaming (Step Functions):"
+  SFN_ARN=$(aws stepfunctions list-state-machines --region $AWS_REGION \
+    --query "stateMachines[?name=='${PROJECT}-streaming-orchestrator'].stateMachineArn" --output text)
+  echo "     aws stepfunctions start-execution \\"
+  echo "       --state-machine-arn $SFN_ARN \\"
+  echo "       --input '{\"msk_bootstrap_servers\":\"${BOOTSTRAP:-}\",\"s3_output_path\":\"s3://$BUCKET_BRONZE/streaming/alfabetizacao/\",\"checkpoint_path\":\"s3://$BUCKET_BRONZE/streaming/checkpoints/\"}'"
+else
+  echo "  2. Consulte as visões Gold no Athena (workgroup ${PROJECT}-workgroup)"
+  echo "     usando athena_queries/validacao_gold.sql"
+  echo ""
+  echo "  ℹ️  Streaming desativado neste ambiente. A arquitetura híbrida completa"
+  echo "     (MSK + Glue Streaming + Step Functions) requer conta com permissão"
+  echo "     kafka:CreateCluster — veja a seção 'Learner Lab' no README."
+fi
+echo ""
+echo "  ⚠️  Execute cleanup.sh ao terminar para evitar cobranças!"
+echo "============================================================"

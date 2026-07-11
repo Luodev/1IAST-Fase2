@@ -134,6 +134,15 @@ bash verificar_limpeza.sh
 
 Os notebooks de `notebooks/` rodam localmente (sem AWS): `pip install pandas pyarrow matplotlib seaborn` e execute-os pelo Jupyter/VS Code. Eles documentam a EDA que fundamentou o desenho da pipeline e provam a idempotência dos scripts de preparação de cada camada.
 
+### Execução no AWS Academy (Learner Lab)
+
+A arquitetura **ideal** deste projeto é a híbrida descrita na seção 3 (batch + streaming via MSK). Contas do Learner Lab, porém, bloqueiam duas permissões que ela exige: `iam:CreateRole` e `kafka:CreateCluster` (MSK). O `setup.sh` detecta esse ambiente automaticamente (pela presença da role `LabRole`) e se adapta:
+
+- **IAM**: reutiliza a `LabRole` para Glue, Lambda e Step Functions, em vez de criar roles;
+- **Streaming**: entra em **modo batch-only** — pula MSK, job de streaming, Lambda Producer, EventBridge e Step Functions. O pipeline batch completo (S3 → Glue Bronze/Silver/Gold → Data Catalog → Athena) funciona integralmente.
+
+O comportamento é controlado pela variável `STREAMING` (`auto` por padrão): `STREAMING=on bash setup.sh` força o provisionamento híbrido (necessário em conta com permissões plenas); `STREAMING=off` força batch-only em qualquer conta. O código de streaming (`streaming_glue.py`, `streaming_producer.py`) permanece no repositório como a arquitetura alvo — para demonstrá-lo de ponta a ponta, execute o setup numa conta AWS pessoal (~US$ 1/sessão com `cleanup.sh` ao final).
+
 ## 6. Tecnologias utilizadas e justificativas
 
 | Tecnologia                            | Papel                                         | Por quê                                                                                             |
@@ -206,3 +215,7 @@ A camada Gold sai pronta para consumo analítico e de ML:
 - **Modelos de predição de alfabetização**: `alfabetizacao_por_municipio` (taxa, gap, nível, série, rede) é uma tabela de features por município/ano; enriquecida com dados socioeconômicos (IBGE/Censo, FUNDEB), suporta regressão da taxa futura e classificação de municípios em risco de não atingir a meta 2030 — a flag `risco_alfabetizacao` do streaming já antecipa esse rótulo em tempo quase real.
 - **Análise de desigualdade educacional**: `evolucao_temporal` e `ranking_municipios` permitem medir dispersão intra-UF (desvio-padrão por UF/ano) e clusterizar municípios por vulnerabilidade educacional (ex.: K-means sobre taxa × gap × proporções por nível de proficiência).
 - **Políticas públicas baseadas em dados**: `comparacao_metas_nacionais` responde diretamente "quais UFs estão fora da trajetória da meta?" — priorização objetiva de investimento; o histórico preservado no Bronze permite avaliar efeito de intervenções ao longo do tempo.
+
+## 12. Fluxo de trabalho Git
+
+Desenvolvimento em branches de funcionalidade (`feature/pipeline-batch`, `feature/streaming`, `feature/integracao-aws`, `feature/documentacao`, `damasceno`) integradas à `main` via Pull Requests com histórico de commits descritivos.
