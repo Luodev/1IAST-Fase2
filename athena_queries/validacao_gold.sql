@@ -5,6 +5,11 @@
 -- Pré-requisito: rodar o crawler alfabetizacao-br-gold-crawler após o
 -- pipeline batch (etl_gold). As tabelas ficam no database alfabetizacao_br_db.
 -- Execute no workgroup alfabetizacao-br-workgroup (cutoff de 1 GB por query).
+--
+-- Particionamento: todas as visões Gold são particionadas por `ano`
+-- (Hive-style, gold/<visao>/ano=YYYY/). Sempre que possível filtre por ano
+-- (WHERE ano = ...) para acionar o partition pruning e reduzir os bytes
+-- escaneados — e, portanto, o custo da query (FinOps).
 -- =============================================================================
 
 -- -----------------------------------------------------------------------------

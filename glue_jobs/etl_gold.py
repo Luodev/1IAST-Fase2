@@ -6,11 +6,19 @@ Lê entidades da camada Silver (pass) e produz 4 visões analíticas:
   3. ranking_municipios           — top/bottom municípios por UF e ano
   4. comparacao_metas_nacionais   — taxa real vs meta nacional por ano
 
+Estratégia de particionamento:
+  Cada visão é gravada particionada por `ano` (gold/<visao>/ano=YYYY/),
+  espelhando Bronze e Silver. Como as análises da Gold são tipicamente
+  filtradas por ano (evolução, ranking, gap de meta), o partition pruning
+  reduz diretamente os bytes escaneados pelo Athena — impacto direto em
+  custo (FinOps). O partitionOverwriteMode=dynamic torna o reprocesso
+  idempotente por ano, sem perder o histórico consolidado.
+
 Padrões do curso aplicados:
   - Múltiplas visões Gold por dimensão analítica
   - Window rank() por UF/ano para ranking
   - groupBy/agg para evolução temporal
-  - partitionOverwriteMode=dynamic
+  - Partição Hive-style ano=YYYY + partitionOverwriteMode=dynamic
   - Validação DQ das visões geradas
   - SUMÁRIO ao fim
 """
@@ -63,10 +71,21 @@ INGESTION_DATE = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 ANOMESDIA      = datetime.now(timezone.utc).strftime("%Y%m%d")
 
 def pass_path(entidade):
-    return f"s3://{BUCKET_SOT}/sot/pass/{entidade}/anomesdia={ANOMESDIA}/"
+    """Silver pass da entidade — todas as partições ano=YYYY."""
+    return f"s3://{BUCKET_SOT}/sot/pass/{entidade}/"
 
 def gold_path(visao):
-    return f"s3://{BUCKET_SPEC}/gold/{visao}/anomesdia={ANOMESDIA}/"
+    """Destino da visão Gold — será particionado por ano na escrita."""
+    return f"s3://{BUCKET_SPEC}/gold/{visao}/"
+
+
+def salvar_gold(df, visao):
+    """Grava a visão particionada por ano (Hive-style, overwrite dinâmico)."""
+    destino = gold_path(visao)
+    df.write.mode("overwrite").partitionBy("ano").parquet(destino)
+    n = df.count()
+    log.info(f"[GOLD] {visao}: {n} registros → {destino} (particionado por ano)")
+    return n
 
 log.info("=" * 65)
 log.info(f"JOB       : {JOB_NAME}")
@@ -123,11 +142,7 @@ def gold_alfabetizacao_municipio():
         .withColumn("_ingestion_date",    F.lit(INGESTION_DATE))
     )
 
-    destino = gold_path("alfabetizacao_por_municipio")
-    df.write.mode("overwrite").parquet(destino)
-    n = df.count()
-    log.info(f"[GOLD] alfabetizacao_por_municipio: {n} registros → {destino}")
-    return n
+    return salvar_gold(df, "alfabetizacao_por_municipio")
 
 
 # ============================================================
@@ -154,11 +169,7 @@ def gold_evolucao_temporal():
         .withColumn("_ingestion_date",    F.lit(INGESTION_DATE))
     )
 
-    destino = gold_path("evolucao_temporal")
-    df.write.mode("overwrite").parquet(destino)
-    n = df.count()
-    log.info(f"[GOLD] evolucao_temporal: {n} registros → {destino}")
-    return n
+    return salvar_gold(df, "evolucao_temporal")
 
 
 # ============================================================
@@ -209,11 +220,7 @@ def gold_ranking_municipios():
         .withColumn("_ingestion_date",    F.lit(INGESTION_DATE))
     )
 
-    destino = gold_path("ranking_municipios")
-    df.write.mode("overwrite").parquet(destino)
-    n = df.count()
-    log.info(f"[GOLD] ranking_municipios: {n} registros → {destino}")
-    return n
+    return salvar_gold(df, "ranking_municipios")
 
 
 # ============================================================
@@ -267,11 +274,7 @@ def gold_comparacao_metas():
         .withColumn("_ingestion_date",    F.lit(INGESTION_DATE))
     )
 
-    destino = gold_path("comparacao_metas_nacionais")
-    df.write.mode("overwrite").parquet(destino)
-    n = df.count()
-    log.info(f"[GOLD] comparacao_metas_nacionais: {n} registros → {destino}")
-    return n
+    return salvar_gold(df, "comparacao_metas_nacionais")
 
 
 # ============================================================

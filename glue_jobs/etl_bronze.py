@@ -1,8 +1,8 @@
 """
 Glue Job — Ingestão Bronze (SOR)
 Lê os 5 CSVs do INEP/Base dos Dados do S3, aplica schema explícito,
-calcula _record_hash MD5, executa checagem de qualidade e particiona
-por ANOMESDIA no S3 Bronze.
+calcula _record_hash MD5, executa checagem de qualidade e grava
+Parquet particionado por ANO (Hive-style: bronze/<entidade>/ano=YYYY/).
 
 Entidades:
   indicador_municipio  — taxa de alfabetização por município/ano/série/rede
@@ -11,13 +11,21 @@ Entidades:
   meta_uf              — metas estaduais de alfabetização
   meta_municipio       — metas municipais de alfabetização
 
+Estratégia de particionamento:
+  A base do indicador cresce um ano a cada ciclo de avaliação (2023, 2024,
+  2025, ...). Particionar por `ano` dentro de cada entidade permite que
+  Athena/Spark leiam apenas as partições necessárias (partition pruning),
+  reduzindo bytes escaneados e custo por query (FinOps). O modo
+  partitionOverwriteMode=dynamic garante que reprocessar um ano NÃO apaga
+  os anos anteriores — o histórico completo é preservado, requisito para
+  qualquer análise comparativa de indicador.
+
 Padrões do curso aplicados:
   - Schema explícito com StructType (evita inferência incorreta)
   - _record_hash MD5 por chave composta (padrão etl-bronze.py)
   - Metadados com prefixo _ (_ingestion_timestamp, _source_entity, etc.)
   - CHECKS dict com PASS / FAIL / WARN e score %
-  - ANOMESDIA como partição (padrão etl_csv_ingestao.py)
-  - partitionOverwriteMode=dynamic
+  - Partição Hive-style ano=YYYY + partitionOverwriteMode=dynamic
   - SUMÁRIO ao fim
 """
 
@@ -301,9 +309,12 @@ for ENTIDADE, ARQUIVO in ARQUIVOS.items():
     df_bronze = construir_bronze(df, ENTIDADE)
     checar_qualidade(df_bronze, ENTIDADE)
 
-    destino = f"s3://{BUCKET_SOR}/bronze/{ENTIDADE}/anomesdia={ANOMESDIA}/"
-    df_bronze.write.mode("overwrite").parquet(destino)
-    log.info(f"[BRONZE] {ENTIDADE}: gravado em {destino}")
+    # Escrita particionada por ano (bronze/<entidade>/ano=YYYY/).
+    # Com partitionOverwriteMode=dynamic, apenas as partições presentes
+    # neste lote são sobrescritas — execução idempotente e histórico preservado.
+    destino = f"s3://{BUCKET_SOR}/bronze/{ENTIDADE}/"
+    df_bronze.write.mode("overwrite").partitionBy("ano").parquet(destino)
+    log.info(f"[BRONZE] {ENTIDADE}: gravado em {destino} (particionado por ano)")
 
     resultados[ENTIDADE] = total_lido
 
