@@ -190,8 +190,22 @@ echo "  Lifecycle Bronze configurado."
 # =============================================================================
 # 3. IAM ROLES
 # =============================================================================
+# Em contas AWS Academy (Learner Lab) a ação iam:CreateRole é bloqueada, mas
+# existe a role pré-provisionada LabRole com permissões amplas e confiança
+# multi-serviço. Detectamos esse ambiente pela presença da LabRole e a
+# reutilizamos para Glue, Lambda e Step Functions, pulando a criação.
 echo ""
-echo ">>> [3/10] Criando IAM roles..."
+echo ">>> [3/10] Configurando IAM roles..."
+
+if aws iam get-role --role-name LabRole --region $AWS_REGION >/dev/null 2>&1; then
+
+  export GLUE_ROLE_ARN=$(aws iam get-role --role-name LabRole --query 'Role.Arn' --output text)
+  export LAMBDA_ROLE_ARN=$GLUE_ROLE_ARN
+  export SFN_ROLE_ARN=$GLUE_ROLE_ARN
+  echo "  ⚠️  Ambiente Learner Lab detectado (iam:CreateRole indisponível)."
+  echo "  Usando LabRole para Glue, Lambda e Step Functions: $GLUE_ROLE_ARN"
+
+else
 
 # Role do Glue
 cat > /tmp/glue-trust.json << 'EOF'
@@ -242,6 +256,8 @@ aws iam put-role-policy --role-name $SFN_ROLE \
 
 export SFN_ROLE_ARN=$(aws iam get-role --role-name $SFN_ROLE --query 'Role.Arn' --output text)
 echo "  Step Functions Role: $SFN_ROLE_ARN"
+
+fi
 
 # =============================================================================
 # 4. CLUSTER MSK (PLAINTEXT, kafka.t3.small × 2)
@@ -609,25 +625,3 @@ echo ""
 echo "============================================================"
 echo "  ✅ Infraestrutura provisionada com sucesso!"
 echo ""
-echo "  BOOTSTRAP MSK : $BOOTSTRAP"
-echo "  Bronze bucket : s3://$BUCKET_BRONZE"
-echo "  Silver bucket : s3://$BUCKET_SILVER"
-echo "  Gold bucket   : s3://$BUCKET_GOLD"
-echo ""
-echo "  PRÓXIMOS PASSOS:"
-echo "  1. Crie o Lambda Layer e descomente a seção 7 deste script"
-echo "  2. Atualize MSK_BOOTSTRAP_SERVERS na Lambda Producer"
-echo "  3. Execute o pipeline batch (aguarde cada job concluir):"
-echo "     aws glue start-job-run --job-name ${PROJECT}-raw-to-bronze"
-echo "     aws glue start-job-run --job-name ${PROJECT}-bronze-to-silver"
-echo "     aws glue start-job-run --job-name ${PROJECT}-silver-to-gold"
-echo "     aws glue start-crawler --name ${PROJECT}-gold-crawler"
-echo "  4. Execute o pipeline streaming (Step Functions):"
-SFN_ARN=$(aws stepfunctions list-state-machines --region $AWS_REGION \
-  --query "stateMachines[?name=='${PROJECT}-streaming-orchestrator'].stateMachineArn" --output text)
-echo "     aws stepfunctions start-execution \\"
-echo "       --state-machine-arn $SFN_ARN \\"
-echo "       --input '{\"msk_bootstrap_servers\":\"$BOOTSTRAP\",\"s3_output_path\":\"s3://$BUCKET_BRONZE/streaming/alfabetizacao/\",\"checkpoint_path\":\"s3://$BUCKET_BRONZE/streaming/checkpoints/\"}'"
-echo ""
-echo "  ⚠️  Execute cleanup.sh ao terminar para evitar cobranças!"
-echo "============================================================"

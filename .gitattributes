@@ -1,0 +1,15 @@
+# Normalização de fim de linha — scripts shell DEVEM ter LF para rodar no
+# bash (WSL/Linux); CRLF do Windows quebra a execução com erros de sintaxe.
+* text=auto
+
+*.sh          text eol=lf
+*.py          text eol=lf
+*.sql         text eol=lf
+*.md          text eol=lf
+*.ipynb       text eol=lf
+.env.example  text eol=lf
+.gitignore    text eol=lf
+
+*.csv         text
+*.pptx        binary
+*.docx        binary

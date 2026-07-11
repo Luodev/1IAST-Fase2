@@ -232,10 +232,11 @@ echo "============================================================"
 if [ "$CLEAN" = true ]; then
   echo "  ✅ AMBIENTE LIMPO — nenhum recurso do projeto remanescente."
   echo "     Nenhum custo residual em andamento."
+  echo "============================================================"
   exit 0
 else
   echo "  ❌ RECURSOS PENDENTES — execute 'bash cleanup.sh' novamente"
   echo "     e rode esta verificação de novo."
+  echo "============================================================"
   exit 1
 fi
-echo "============================================================"
